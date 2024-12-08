@@ -15,23 +15,29 @@
 SX1262 radio = new Module(SS, DIO0, RST_LoRa, BUSY_LoRa);
 Preferences preferences;
 unsigned long lastTxExtSonTime = 0;            // Variable dernière transmission sonde
-const unsigned long txExtSonInterval = 600000; // Interval de transmission en millisecondes (10 minutes)
+unsigned long lastTxSatelliteTime = 0;            // Variable dernière transmission satellite
+unsigned long lastSyncTime = 0;
+const unsigned long txInterval = 600000; // Interval de transmission en millisecondes (10 minutes)
+const unsigned long IntervalBTW = 180000; // Interval de transmission entre sonde Ext et Satellite (3 minutes)
+const unsigned long IntervalSycn24 = 86400000; //Interal de 24h pour relancer une trame de syncro
 String DateTimeRes;
 String tempAmbiante;
 String tempExterieure;
 String tempConsigne;
 String modeFrisquet;
 String assSonFrisquet;
-String assConFrisquet;
+String assSatFrisquet;
 String byteArrayToHexString(uint8_t *byteArray, int length);
-byte extSonTempBytes[2];
-byte sonMsgNum = 0x01;
+byte extSonTempBytes[2];   //variable playload température extérieur
+byte intSatTempBytes[2];   //varaible playload température intérieur
+byte tempConsigneBytes[2]; //variable playload température consigne
 int counter = 0;
 uint8_t custom_network_id[4];
 uint8_t custom_extSon_id;
 float temperatureValue;
 float temperatureconsValue;
 float extSonVal;
+float intSatVal;
 WiFiClient espClient;
 PubSubClient client(espClient);
 WiFiUDP ntpUDP;
@@ -43,19 +49,46 @@ Timezone timeZone(CEST, CET);
 bool tempAmbianteChanged = false;
 bool tempExterieureChanged = false;
 bool tempConsigneChanged = false;
+bool modeOuConsToSendChanged = false;
 bool modeFrisquetChanged = false;
 bool assSonFrisquetChanged = false;
-bool assConFrisquetChanged = false;
+bool assSatFrisquetChanged = false;
 bool eraseNvs = false;
+bool satSyncDone = false;
 // Constantes pour les topics MQTT
 const char *TEMP_AMBIANTE1_TOPIC = "homeassistant/sensor/frisquet/tempAmbiante1/state";
 const char *TEMP_EXTERIEURE_TOPIC = "homeassistant/sensor/frisquet/tempExterieure/state";
 const char *TEMP_CONSIGNE1_TOPIC = "homeassistant/sensor/frisquet/tempConsigne1/state";
 const char *MODE_TOPIC = "homeassistant/select/frisquet/mode/set";
 const char *ASS_SON_TOPIC = "homeassistant/switch/frisquet/asssonde/set";
-const char *ASS_CON_TOPIC = "homeassistant/switch/frisquet/assconnect/set";
-uint8_t TempExTx[] = {0x80, 0x20, 0x00, 0x00, 0x01, 0x17, 0x9c, 0x54, 0x00, 0x04, 0xa0, 0x29, 0x00, 0x01, 0x02, 0x00, 0x00}; // envoi température
-byte TxByteArr[10] = {0x80, 0x20, 0x00, 0x00, 0x82, 0x41, 0x01, 0x21, 0x01, 0x02};                                           // association Sonde exterieure
+const char *ASS_SAT_TOPIC = "homeassistant/switch/frisquet/asssatellite/set";
+
+byte sonMsgNum = 0x00;
+byte satMsgNum = 0x00;
+byte toID = 0x80;      // 01 - 80 (boiler)
+byte fromID = 0x08;    // 02 - 08 (satellite) ou 7E (connect)
+byte modeSat = 0x01; //variable mode de chauffage
+
+
+// -- Initialisation de la chaîne de requête a la chaudière pour récupérer l'état actuelle au démarrage de l'arduino (trame 17 sat)
+uint8_t BoilerTxInf[] = {0x80, 0x08, SatZ1_id, 0x00, 0x01, 0x17, 0xA0, 0x29, 0x00, 0x15, 0xA0, 0x2F, 0x00, 0x01, 0x02, 0x00, 0xC8};
+
+// exemple playload envoi satellite (trame 23) : 80 08 77 08 01 17 A0 29 00 15 A0 2F 00 04 08 00 D0 00 C8 00 01 00 00
+uint8_t BoilerTx[] = {0x80, 0x08, SatZ1_id, 0x00, 0x01, 0x17, 0xA0, 0x29, 0x00, 0x15, 0xA0, 0x2F, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xC6};
+
+// Trame 8 - Demande de synchro satellite > Chaudière
+uint8_t BoilerTxSycn[] ={0x80, 0x08, SatZ1_id, 0x00, 0x01, 0x43, 0x00, 0x00};
+
+// Trame 6 - Réponse de synchro chaudière
+// uint8_t BoilerRep[] ={0x08, 0x80, SatZ1_id, 0x01, 0x81, 0x43};
+
+// envoi température Ext
+uint8_t TempExTx[] = {0x80, 0x20, 0x00, 0x00, 0x01, 0x17, 0x9c, 0x54, 0x00, 0x04, 0xa0, 0x29, 0x00, 0x01, 0x02, 0x00, 0x00};
+
+//trame association sonde extérieur
+byte TxByteArr[10] = {0x80, 0x20, 0x00, 0x00, 0x82, 0x41, 0x01, 0x21, 0x01, 0x02};
+
+
 //****************************************************************************
 void sendTxByteArr()
 {
@@ -93,16 +126,16 @@ void updateDisplay()
     tempConsigneChanged = false;
     modeFrisquetChanged = false;
   }
-  else if (assSonFrisquetChanged || assConFrisquetChanged)
+  else if (assSonFrisquetChanged || assSatFrisquetChanged)
   {
     Heltec.display->clear();
     Heltec.display->drawString(0, 0, "Net: " + byteArrayToHexString(custom_network_id, sizeof(custom_network_id)) + " Son: " + byteArrayToHexString(&custom_extSon_id, 1));
     Heltec.display->drawString(0, 11, "Ass. sonde en cours: " + assSonFrisquet);
-    Heltec.display->drawString(0, 22, "Ass. connect en cours: " + assConFrisquet);
+    Heltec.display->drawString(0, 22, "Ass. connect en cours: " + assSatFrisquet);
 
     Heltec.display->display();
     assSonFrisquetChanged = false;
-    assConFrisquetChanged = false;
+    assSatFrisquetChanged = false;
   }
 }
 //****************************************************************************
@@ -119,6 +152,10 @@ void callback(char *topic, byte *payload, unsigned int length)
     if (tempAmbiante != String(message))
     {
       tempAmbiante = String(message);
+      intSatVal = tempAmbiante.toFloat() * 10;
+      int intSatTemp = int(intSatVal);
+      intSatTempBytes[0] = (intSatTemp >> 8) & 0xFF;
+      intSatTempBytes[1] = intSatTemp & 0xFF;
       tempAmbianteChanged = true;
     }
   }
@@ -139,7 +176,12 @@ void callback(char *topic, byte *payload, unsigned int length)
     if (tempConsigne != String(message))
     {
       tempConsigne = String(message);
+      temperatureconsValue = tempConsigne.toFloat() * 10;
+      int tempCons = int(temperatureconsValue);
+      tempConsigneBytes[0] = (tempCons >> 8) & 0xFF;
+      tempConsigneBytes[1] = tempCons & 0xFF;
       tempConsigneChanged = true;
+      modeOuConsToSendChanged = true;
     }
   }
   else if (strcmp(topic, MODE_TOPIC) == 0)
@@ -147,7 +189,20 @@ void callback(char *topic, byte *payload, unsigned int length)
     if (modeFrisquet != String(message))
     {
       modeFrisquet = String(message);
+      if (modeFrisquet == "Confort")
+      {
+        modeSat = 0x05;
+      }
+      else if (modeFrisquet == "Réduit")
+      {
+        modeSat = 0x04;
+      }
+      else if (modeFrisquet == "Hors gel")
+      {
+        modeSat = 0x10;
+      }
       modeFrisquetChanged = true;
+      modeOuConsToSendChanged = true;
       client.publish("homeassistant/select/frisquet/mode/state", message);
     }
   }
@@ -160,13 +215,13 @@ void callback(char *topic, byte *payload, unsigned int length)
       client.publish("homeassistant/switch/frisquet/asssonde/state", message);
     }
   }
-  else if (strcmp(topic, ASS_CON_TOPIC) == 0)
+  else if (strcmp(topic, ASS_SAT_TOPIC) == 0)
   {
-    if (assConFrisquet != String(message))
+    if (assSatFrisquet != String(message))
     {
-      assConFrisquet = String(message);
-      assConFrisquetChanged = true;
-      client.publish("homeassistant/switch/frisquet/assconnect/state", message);
+      assSatFrisquet = String(message);
+      assSatFrisquetChanged = true;
+      client.publish("homeassistant/switch/frisquet/asssatellite/state", message);
     }
   }
 }
@@ -287,7 +342,7 @@ void connectToTopic()
   connectToSensor("tempExterieure", "exterieure");
   connectToSensor("tempConsigne1", "consigne Z1");
   connectToSwitch("asssonde", "ass. sonde");
-  connectToSwitch("assconnect", "ass. connect");
+  connectToSwitch("asssatellite", "ass. satellite");
   if (sensorZ2 == true)
   {
     connectToSensor("tempAmbiante2", "ambiante Z2");
@@ -314,14 +369,14 @@ void connectToTopic()
         "name": "Frisquet - Mode",
         "state_topic": "homeassistant/select/frisquet/mode/state",
         "command_topic": "homeassistant/select/frisquet/mode/set",
-        "options": ["Auto", "Confort", "Réduit", "Hors gel"],
+        "options": ["Confort", "Réduit", "Hors gel"],
         "device":{"ids":["FrisquetConnect"],"mf":"Frisquet","name":"Frisquet Connect","mdl":"Frisquet Connect"}
       })";
   client.publish(modeConfigTopic, modeConfigPayload, true); // true pour retenir le message
   // Souscrire aux topics temp ambiante, consigne, ext et mode
   client.subscribe(MODE_TOPIC);
   client.subscribe(ASS_SON_TOPIC);
-  client.subscribe(ASS_CON_TOPIC);
+  client.subscribe(ASS_SAT_TOPIC);
   client.subscribe(TEMP_AMBIANTE1_TOPIC);
   client.subscribe(TEMP_EXTERIEURE_TOPIC);
   client.subscribe(TEMP_CONSIGNE1_TOPIC);
@@ -349,6 +404,29 @@ void txExtSonTemp()
   Serial.println();
   // Transmettre la chaine TempExTx
   int state = radio.transmit(TempExTx, sizeof(TempExTx));
+}
+//*****************************************************************************
+void txSatellite()
+{
+  satMsgNum += 4;
+  
+  BoilerTx[3] = satMsgNum;
+  BoilerTx[15] = intSatTempBytes[0];
+  BoilerTx[16] = intSatTempBytes[1];
+  BoilerTx[17] = tempConsigneBytes[0];
+  BoilerTx[18] = tempConsigneBytes[1];
+  BoilerTx[20] = modeSat;
+  
+  // Afficher le payload dans la console
+  Serial.print("Payload Satellite transmit: ");
+  for (int i = 0; i < sizeof(BoilerTx); i++)
+  {
+    Serial.printf("%02X ", BoilerTx[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+  // Transmettre la chaine BoilerExTx
+  radio.transmit(BoilerTx, sizeof(BoilerTx));
 }
 //****************************************************************************
 void assExtSonde()
@@ -409,6 +487,49 @@ void assExtSonde()
   }
 }
 //****************************************************************************
+void satSync()
+{
+  client.loop();
+  satMsgNum = 0x00;
+  
+  BoilerTxInf[3] = satMsgNum;
+  BoilerTxInf[16] = intSatTempBytes[0];
+  BoilerTxInf[17] = intSatTempBytes[1];
+
+  while (satMsgNum != 0x02)
+  {
+    // Afficher le payload dans la console
+    Serial.print("Payload Sat Info transmit: ");
+    for (int i = 0; i < sizeof(BoilerTxInf); i++)
+    {
+      Serial.printf("%02X ", BoilerTxInf[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+    // Transmettre la chaine BoilerTxInf
+    radio.transmit(BoilerTxInf, sizeof(BoilerTxInf));
+
+    delay(100);
+    
+    satMsgNum += 1;
+  }
+
+  delay(100);
+  satMsgNum += 2;
+  // Afficher le payload dans la console
+  Serial.print("Payload Sat Sycn transmit: ");
+  for (int i = 0; i < sizeof(BoilerTxSycn); i++)
+  {
+    Serial.printf("%02X ", BoilerTxSycn[i]);
+    Serial.print(" ");
+  }
+
+  radio.transmit(BoilerTxSycn, sizeof(BoilerTxSycn));
+
+  Serial.println("attente reponse chaudiere");
+}
+
+//****************************************************************************
 void initOTA();
 //****************************************************************************
 void setup()
@@ -419,7 +540,7 @@ void setup()
   WiFi.begin(ssid, password);
   while (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
-    Serial.println("Connection Failed! Rebooting...");
+    Serial.println("Connection Wifi Failed! Rebooting...");
     delay(5000);
     ESP.restart();
   }
@@ -464,6 +585,8 @@ void setup()
   connectToTopic();
   client.setCallback(callback);
   preferences.end(); // Fermez la mémoire NVS ici
+ 
+  Serial.println("Fin du setup");
 }
 //****************************************************************************
 void loop()
@@ -474,24 +597,60 @@ void loop()
   {
     assExtSonde();
   }
+  // Vérifier si custom_extSon_id n'est pas égal à 0 byte
+  else if (memcmp(custom_network_id, "\xFF\xFF\xFF\xFF", 4) == 0 && custom_extSon_id == 0x00)
+  {
+    Serial.println("Id sonde externe non connue");
+  }
   else
   {
+    
     unsigned long currentTime = millis();
-    // Vérifier si 10 minutes se sont écoulées depuis la dernière transmission
-    if (currentTime - lastTxExtSonTime >= txExtSonInterval)
+    
+//appel fonction première trame de sync
+    if (!satSyncDone)
     {
-      // Vérifier si custom_extSon_id n'est pas égal à 0 byte
-      if (memcmp(custom_network_id, "\xFF\xFF\xFF\xFF", 4) != 0 && custom_extSon_id != 0x00)
-      {
-        txExtSonTemp(); // Appeler la fonction pour transmettre les données
-      }
-      else
-      {
-        Serial.println("Id sonde externe non connue");
-      }
-      // Mettre à jour le temps de la dernière transmission
-      lastTxExtSonTime = currentTime;
+      Serial.println("Appel fonction satSync");
+      satSync();
+      satSyncDone = true;
+      lastSyncTime = currentTime;
+      goto lecture_radio;
     }
+    
+    // appel synchro toutes les 24h
+    if (currentTime - lastSyncTime >= IntervalSycn24)
+    {
+      satSync();
+      lastSyncTime = currentTime;
+      goto lecture_radio;
+    }
+    
+    // Vérifier si 10 minutes se sont écoulées depuis la dernière transmission sonde ext
+    if (currentTime - lastTxExtSonTime >= txInterval)
+    {
+      Serial.println("Appel fonction txExtSonTemp");
+      txExtSonTemp(); // Appeler la fonction pour transmettre les données
+      lastTxExtSonTime = currentTime;
+      goto lecture_radio;
+    }
+    if (lastTxSatelliteTime == 0)  //Si temps de dernier envoi egal 0 rien n'a été envoyé, on lui donne le temps actuel + 3min pour être en décallé avec la sonde
+    {
+      lastTxSatelliteTime = currentTime+IntervalBTW;
+    }
+    // Vérifier si 10 minutes se sont écoulées depuis la dernière transmission satellite
+    if (currentTime - lastTxSatelliteTime >= txInterval )
+    {
+      Serial.println("Appel fonction txSatellite");
+      txSatellite(); // Appeler la fonction pour transmettre les données
+      lastTxSatelliteTime = currentTime;
+      goto lecture_radio;
+    }
+    if (modeOuConsToSendChanged == true)
+    {
+      txSatellite(); // Appeler la fonction pour transmettre les données
+      modeOuConsToSendChanged = false;
+    }
+    
     if (!client.connected())
     {
       connectToMqtt();
@@ -506,6 +665,8 @@ void loop()
     }
     counter++;
 
+    lecture_radio:
+
     char message[255];
     byte byteArr[RADIOLIB_SX126X_MAX_PACKET_LENGTH];
     int state = radio.receive(byteArr, 0);
@@ -515,24 +676,58 @@ void loop()
       Serial.printf("RECEIVED [%2d] : ", len);
       message[0] = '\0';
 
-      if (len == 23)
-      { // Check if the length is 23 bytes
-
-        // Extract bytes 16 and 17
-        int decimalValueTemp = byteArr[15] << 8 | byteArr[16];
-        float temperatureValue = decimalValueTemp / 10.0;
-        // Extract bytes 18 and 19
-        int decimalValueCons = byteArr[17] << 8 | byteArr[18];
-        float temperatureconsValue = decimalValueCons / 10.0;
-        // Publish temperature to the "frisquet_temperature" MQTT topic
-        char temperaturePayload[10];
-        snprintf(temperaturePayload, sizeof(temperaturePayload), "%.2f", temperatureValue);
-        publishMessage(TEMP_AMBIANTE1_TOPIC, temperaturePayload);
-        // Publish temperature to the "tempconsigne" MQTT topic
-        char tempconsignePayload[10];
-        snprintf(tempconsignePayload, sizeof(tempconsignePayload), "%.2f", temperatureconsValue);
-        publishMessage(TEMP_CONSIGNE1_TOPIC, tempconsignePayload);
+      if (len == 6)
+      {
+        if (byteArr[3] == satMsgNum && byteArr[5] == 0x43)
+        {
+          Serial.println("Reponse chaudiere OK");
+        }
+        txSatellite();  //envoie trame 23
+        currentTime = millis();
+        lastTxSatelliteTime = currentTime;
       }
+
+      if (len == 49)
+      {
+        Serial.println("Retour chaudiere trame 49");
+        // Extract bytes 16 and 17
+        //int decimalValueTemp = byteArr[19] << 8 | byteArr[20];
+        //float temperatureValue = decimalValueTemp / 10.0;
+        // Extract bytes 18 and 19
+        //int decimalValueCons = byteArr[21] << 8 | byteArr[22];
+        //float temperatureconsValue = decimalValueCons / 10.0;
+        // Publish temperature to the "frisquet_temperature" MQTT topic
+        //char temperaturePayload[10];
+        //snprintf(temperaturePayload, sizeof(temperaturePayload), "%.2f", temperatureValue);
+        //publishMessage(TEMP_AMBIANTE1_TOPIC, temperaturePayload);
+        // Publish temperature to the "tempconsigne" MQTT topic
+        //char tempconsignePayload[10];
+        //snprintf(tempconsignePayload, sizeof(tempconsignePayload), "%.2f", temperatureconsValue);
+        //publishMessage(TEMP_CONSIGNE1_TOPIC, tempconsignePayload);
+      }
+      
+      
+
+
+//      if (len == 23)
+//      { // Check if the length is 23 bytes
+//
+//        // Extract bytes 16 and 17
+//        int decimalValueTemp = byteArr[15] << 8 | byteArr[16];
+//        float temperatureValue = decimalValueTemp / 10.0;
+//        // Extract bytes 18 and 19
+//        int decimalValueCons = byteArr[17] << 8 | byteArr[18];
+//        float temperatureconsValue = decimalValueCons / 10.0;
+//        // Publish temperature to the "frisquet_temperature" MQTT topic
+//        char temperaturePayload[10];
+//        snprintf(temperaturePayload, sizeof(temperaturePayload), "%.2f", temperatureValue);
+//        publishMessage(TEMP_AMBIANTE1_TOPIC, temperaturePayload);
+//        // Publish temperature to the "tempconsigne" MQTT topic
+//        char tempconsignePayload[10];
+//        snprintf(tempconsignePayload, sizeof(tempconsignePayload), "%.2f", temperatureconsValue);
+//        publishMessage(TEMP_CONSIGNE1_TOPIC, tempconsignePayload);
+//      }
+
       for (int i = 0; i < len; i++)
       {
         sprintf(message + strlen(message), "%02X ", byteArr[i]);
@@ -544,7 +739,10 @@ void loop()
       }
       Serial.println("");
     }
+    
+    
   }
+  
   client.loop();
   updateDisplay(); // Mettre à jour l'affichage si nécessaire
 }
